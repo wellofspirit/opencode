@@ -41,7 +41,7 @@ export const JudgeApi = HttpApi.make("judge")
             identifier: "judge.completion",
             summary: "Tool-less single-turn completion",
             description:
-              "Run one system+user completion straight against the resolved provider model. Creates no session, registers no tools and never consults the permission layer, so the caller cannot be steered into executing anything.",
+              "Run one system+user completion straight against the resolved provider model. Creates no session, registers no tools and never consults the permission layer, so the caller cannot be steered into executing anything. maxTokens is clamped to the model's output ceiling and stopSequences are passed through, except where the provider rejects them (the ChatGPT/Codex OAuth backend and Copilot gpt-* reject an output cap; OpenAI's Responses API has no stop-sequence parameter).",
           }),
         ),
       )
