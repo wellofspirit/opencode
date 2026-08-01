@@ -197,6 +197,21 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           permission: Permission.merge(current.permission ?? [], ctx.payload.permission),
         })
       }
+      // Sealing is applied AFTER the ruleset patch above so a single PATCH can
+      // atomically hand a session its deny-all AND cut it off from the
+      // instance-global approvals that would otherwise outrank it.
+      //
+      // Held in Permission's instance state rather than the session row: the
+      // `approved` list this cancels is itself in-memory and instance-scoped,
+      // so a durable flag would outlive the risk it exists to cancel, and a
+      // schema/migration change would fork the on-disk DB away from upstream's.
+      // Sealed sessions are throwaways that never outlive the server anyway.
+      if (ctx.payload.permissionHermetic !== undefined) {
+        yield* permissionSvc.seal({
+          sessionID: ctx.params.sessionID,
+          hermetic: ctx.payload.permissionHermetic,
+        })
+      }
       if (ctx.payload.time?.archived !== undefined) {
         yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
       }

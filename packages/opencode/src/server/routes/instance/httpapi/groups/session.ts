@@ -50,6 +50,10 @@ export const UpdatePayload = Schema.Struct({
   title: Schema.optional(Schema.String),
   metadata: Schema.optional(Session.Metadata),
   permission: Schema.optional(PermissionV1.Ruleset),
+  // Seal this session: evaluate it against its own ruleset ONLY, ignoring (and
+  // not extending) the instance-global "always" approvals. Meant for throwaway
+  // sessions patched deny-all before they are prompted — see Permission.seal.
+  permissionHermetic: Schema.optional(Schema.Boolean),
   time: Schema.optional(
     Schema.Struct({
       archived: Schema.optional(Session.ArchivedTimestamp),

@@ -13,6 +13,14 @@ export interface Interface {
   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
+  /**
+   * Mark a session hermetic (or clear the mark).
+   *
+   * A hermetic session is evaluated against its OWN ruleset only: the
+   * instance-global `approved` list is neither consulted for it nor extended
+   * by it. See {@link State.hermetic}.
+   */
+  readonly seal: (input: { sessionID: string; hermetic: boolean }) => Effect.Effect<void>
 }
 
 interface PendingEntry {
@@ -22,7 +30,28 @@ interface PendingEntry {
 
 interface State {
   pending: Map<PermissionV1.ID, PendingEntry>
+  /**
+   * "Always" approvals, INSTANCE-GLOBAL and deliberately not keyed by session:
+   * approving `bash: git *` once applies to every session on this server.
+   */
   approved: PermissionV1.Rule[]
+  /**
+   * Sessions excluded from {@link State.approved} in both directions.
+   *
+   * A caller that seals a session is asserting that the session's own ruleset
+   * is the whole truth for it. The motivating case is a tool-less security
+   * judge or side-question session which is patched deny-all before it is
+   * prompted: without this, `evaluate()` appends `approved` AFTER the session
+   * ruleset and `findLast` wins, so any pattern the user ever always-approved
+   * anywhere on this server outranks that deny-all — a prompt-injected judge
+   * could then execute it. A sealed session also never CONTRIBUTES to
+   * `approved`, so it cannot widen the instance for everybody else.
+   *
+   * Lives beside `approved` in instance state on purpose: it exists to cancel
+   * an in-memory, instance-scoped list, so it has exactly that lifetime and
+   * needs no persistence (see the route note in the http handler).
+   */
+  hermetic: Set<string>
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
@@ -49,6 +78,7 @@ const layer = Layer.effect(
         const state = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
+          hermetic: new Set<string>(),
         }
 
         yield* Effect.addFinalizer(() =>
@@ -65,12 +95,17 @@ const layer = Layer.effect(
     )
 
     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, pending, hermetic } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
       let needsAsk = false
 
+      // A sealed session sees its own ruleset and nothing else. Note this is
+      // the ONLY behavioural difference: an unsealed session evaluates against
+      // exactly the same rulesets, in the same order, as before.
+      const rulesets = hermetic.has(request.sessionID) ? [ruleset] : [ruleset, approved]
+
       for (const pattern of request.patterns) {
-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+        const rule = evaluate(request.permission, pattern, ...rulesets)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
           return yield* new PermissionV1.DeniedError({
@@ -107,7 +142,7 @@ const layer = Layer.effect(
     })
 
     const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, pending, hermetic } = yield* InstanceState.get(state)
       const existing = pending.get(input.requestID)
       if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
 
@@ -142,6 +177,10 @@ const layer = Layer.effect(
       yield* Deferred.succeed(existing.deferred, undefined)
       if (input.reply === "once") return
 
+      // Sealed sessions are a sink, never a source: an "always" answered inside
+      // one must not widen the instance-global list for every other session.
+      if (hermetic.has(existing.info.sessionID)) return
+
       for (const pattern of existing.info.always) {
         approved.push({
           permission: existing.info.permission,
@@ -171,7 +210,14 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.info)
     })
 
-    return Service.of({ ask, reply, list })
+    const seal = Effect.fn("Permission.seal")(function* (input: { sessionID: string; hermetic: boolean }) {
+      const { hermetic } = yield* InstanceState.get(state)
+      if (input.hermetic) hermetic.add(input.sessionID)
+      else hermetic.delete(input.sessionID)
+      yield* Effect.logInfo("sealed", { sessionID: input.sessionID, hermetic: input.hermetic })
+    })
+
+    return Service.of({ ask, reply, list, seal })
   }),
 )
 
