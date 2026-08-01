@@ -354,11 +354,18 @@ function normalizeMessages(
   return msgs
 }
 
-function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
-  const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
-  const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
-
-  const providerOptions = {
+/**
+ * One Anthropic-style cache breakpoint, keyed by the AI SDK provider slug that
+ * reads it. A fresh object every call: callers merge into it per message.
+ *
+ * Exported for the tool-less judge route
+ * (`server/routes/instance/httpapi/handlers/judge.ts`), which marks its single
+ * system message without running the rest of this message middleware. Keep the
+ * two in lockstep — a provider added here is a provider the judge should cache
+ * against too.
+ */
+export function cacheMarkers(): Record<string, any> {
+  return {
     anthropic: {
       cacheControl: { type: "ephemeral" },
     },
@@ -378,6 +385,41 @@ function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage
       cacheControl: { type: "ephemeral" },
     },
   }
+}
+
+/**
+ * Does this model want EXPLICIT cache breakpoints? False either because the
+ * provider caches automatically (OpenAI Responses prefix caching, the Vercel
+ * gateway's `caching: "auto"`, `@ai-sdk/anthropic`'s own automatic mode) or
+ * because it has no prompt cache at all — in both cases a marker is at best
+ * dead weight and at worst a 400.
+ *
+ * Split out of {@link message} so the judge route can ask the same question
+ * without going through the middleware.
+ */
+export function usesCacheMarkers(model: Provider.Model, options: Record<string, unknown>): boolean {
+  const usesAnthropicAutomaticCaching =
+    options.cacheControl !== undefined &&
+    (model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic")
+  return (
+    (model.providerID === "anthropic" ||
+      model.providerID === "google-vertex-anthropic" ||
+      model.api.id.includes("anthropic") ||
+      model.api.id.includes("claude") ||
+      model.id.includes("anthropic") ||
+      model.id.includes("claude") ||
+      model.api.npm === "@ai-sdk/anthropic" ||
+      model.api.npm === "@ai-sdk/alibaba") &&
+    model.api.npm !== "@ai-sdk/gateway" &&
+    !usesAnthropicAutomaticCaching
+  )
+}
+
+function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
+  const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
+  const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
+
+  const providerOptions = cacheMarkers()
 
   for (const msg of unique([...system, ...final])) {
     const useMessageLevelOptions =
@@ -464,21 +506,7 @@ function mapProviderOptions(
 export function message(msgs: ModelMessage[], model: Provider.Model, options: Record<string, unknown>) {
   msgs = unsupportedParts(msgs, model)
   msgs = normalizeMessages(msgs, model, options)
-  const usesAnthropicAutomaticCaching =
-    options.cacheControl !== undefined &&
-    (model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic")
-  if (
-    (model.providerID === "anthropic" ||
-      model.providerID === "google-vertex-anthropic" ||
-      model.api.id.includes("anthropic") ||
-      model.api.id.includes("claude") ||
-      model.id.includes("anthropic") ||
-      model.id.includes("claude") ||
-      model.api.npm === "@ai-sdk/anthropic" ||
-      model.api.npm === "@ai-sdk/alibaba") &&
-    model.api.npm !== "@ai-sdk/gateway" &&
-    !usesAnthropicAutomaticCaching
-  ) {
+  if (usesCacheMarkers(model, options)) {
     msgs = applyCaching(msgs, model)
   }
 

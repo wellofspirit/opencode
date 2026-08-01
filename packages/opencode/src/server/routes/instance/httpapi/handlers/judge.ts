@@ -2,7 +2,8 @@ import { Auth } from "@/auth"
 import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { APICallError, streamText } from "ai"
+import { APICallError, streamText, type ModelMessage } from "ai"
+import { createHash } from "crypto"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import os from "os"
@@ -88,13 +89,110 @@ function rejectsOutputCap(model: Provider.Model): boolean {
  * interaction hints its API tolerates the absence of, and its hook's
  * session-parts lookup has no judge-side equivalent.
  */
-function providerHeaders(model: Provider.Model, requestID: string): Record<string, string> {
+function providerHeaders(model: Provider.Model, cacheID: string): Record<string, string> {
   if (model.providerID !== "openai") return { "User-Agent": USER_AGENT }
   return {
     originator: "opencode",
     "User-Agent": `opencode/${InstallationVersion} (${os.platform()} ${os.release()}; ${os.arch()})`,
-    "session-id": requestID,
+    // The codex hook sends the *session* id here (codex.ts:552). It is a
+    // routing/affinity key, so a per-call random value would scatter otherwise
+    // identical judge calls across cache shards. See {@link cacheID}.
+    "session-id": cacheID,
   }
+}
+
+/**
+ * Prompt-cache identity for this call, derived from the SYSTEM prompt ALONE.
+ *
+ * The session path keys caching off `sessionID`
+ * (`ProviderTransform.options()`), which this route has no equivalent of. What
+ * it does have is something better suited: the judge's system prompt is a large
+ * (~24 KB for ClaudeUI's policy), byte-stable document reused across every call
+ * of a session, while the `user` part is a fresh transcript each time. Hashing
+ * the system prompt therefore names exactly the cacheable prefix — the same
+ * policy lands on the same cache shard whoever calls it, and a changed policy
+ * gets a different key instead of thrashing an existing entry.
+ *
+ * Truncated to 128 bits: this is a routing hint, not a security boundary, and
+ * the prompt itself is re-sent and re-validated by the provider on every call.
+ */
+function cacheID(system: string): string {
+  return `judge-${createHash("sha256").update(system).digest("hex").slice(0, 32)}`
+}
+
+/**
+ * Where each provider family wants the prompt-cache key. Mirrors the
+ * `setCacheKey` block in `ProviderTransform.options()`
+ * (provider/transform.ts) — same providers, same option names; only the value
+ * differs (system-prompt hash instead of session id, see {@link cacheID}).
+ *
+ * Absent from this list are the providers that take explicit `cache_control`
+ * breakpoints instead — those are handled by {@link systemMessage} — and the
+ * ones with no prompt cache at all.
+ */
+function cacheKeyOptions(model: Provider.Model, id: string): Record<string, string> {
+  if (model.api.npm === "@ai-sdk/deepinfra" || model.api.npm === "@ai-sdk/cerebras") return { prompt_cache_key: id }
+  if (
+    model.api.npm === "@ai-sdk/openai" ||
+    model.api.npm === "@ai-sdk/azure" ||
+    model.api.npm === "@ai-sdk/xai" ||
+    model.api.npm === "@ai-sdk/mistral" ||
+    model.api.npm === "venice-ai-sdk-provider"
+  ) {
+    return { promptCacheKey: id }
+  }
+  if (model.providerID.startsWith("opencode") && model.api.id.includes("gpt-5")) return { promptCacheKey: id }
+  return {}
+}
+
+/**
+ * The judge's system prompt as a message, carrying a cache breakpoint when the
+ * provider wants one.
+ *
+ * Only the SYSTEM part is marked, and deliberately so. `ProviderTransform`'s
+ * `applyCaching` marks up to four breakpoints (two system messages, the last
+ * two non-system messages) because a session replays a growing conversation
+ * whose tail is stable between turns. A judge call is one system + one user
+ * turn where the user part is a *different transcript every time*: a
+ * breakpoint there could never hit, and on providers that cap breakpoints
+ * (Alibaba: 4) it would spend one of them for nothing.
+ *
+ * The provider gate and the marker set come from `ProviderTransform` rather
+ * than being copied, so a provider upstream adds to `applyCaching` starts
+ * being cached here in the same commit.
+ */
+function systemMessage(system: string, model: Provider.Model, options: Record<string, unknown>): ModelMessage {
+  if (!ProviderTransform.usesCacheMarkers(model, options)) return { role: "system", content: system }
+  return { role: "system", content: system, providerOptions: ProviderTransform.cacheMarkers() }
+}
+
+/** `stream.usage`, narrowed to the fields worth reporting. Mirrors the shape
+ *  `session/llm/ai-sdk.ts` normalizes to, so a caller reading both sees one
+ *  vocabulary. `cacheReadInputTokens` is the whole point of P3 — it is the
+ *  only in-band proof that the system prompt was served from cache. */
+function usageOf(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const item = value as {
+    inputTokens?: number
+    outputTokens?: number
+    totalTokens?: number
+    reasoningTokens?: number
+    cachedInputTokens?: number
+    inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number }
+    outputTokenDetails?: { reasoningTokens?: number }
+  }
+  const result: Record<string, number> = {}
+  for (const [key, value] of Object.entries({
+    inputTokens: item.inputTokens,
+    outputTokens: item.outputTokens,
+    totalTokens: item.totalTokens,
+    reasoningTokens: item.outputTokenDetails?.reasoningTokens ?? item.reasoningTokens,
+    cacheReadInputTokens: item.inputTokenDetails?.cacheReadTokens ?? item.cachedInputTokens,
+    cacheWriteInputTokens: item.inputTokenDetails?.cacheWriteTokens,
+  })) {
+    if (typeof value === "number") result[key] = value
+  }
+  return Object.keys(result).length === 0 ? undefined : result
 }
 
 /**
@@ -117,6 +215,38 @@ function providerHeaders(model: Provider.Model, requestID: string): Record<strin
  * {@link rejectsOutputCap} 400 on an output cap so the field is dropped, and
  * OpenAI's Responses API has no stop-sequence parameter at all — the AI SDK
  * drops it with an "unsupported" warning (@ai-sdk/openai responses model).
+ *
+ * ## Prompt caching (ADR-037 P3)
+ *
+ * A judge call is a huge, stable system prompt plus a small, always-different
+ * user turn. That is the ideal caching shape, and the route serves it two ways
+ * depending on what the provider offers:
+ *
+ *  - **Explicit breakpoints** (Anthropic-style `cache_control`, plus Alibaba,
+ *    OpenRouter, Bedrock, Copilot): one marker on the system message, none on
+ *    the user turn — see {@link systemMessage}.
+ *  - **Automatic prefix caching** (OpenAI Responses and friends): nothing to
+ *    mark; the provider hashes the leading bytes of the request itself. All
+ *    this route has to do is not defeat it, which imposes a real constraint:
+ *    **everything ahead of the user turn must be byte-identical call to call.**
+ *    It is — and each of these is load-bearing:
+ *      * `options` comes from `ProviderTransform.smallOptions(model)`, which is
+ *        a pure function of the model. The session path's
+ *        `ProviderTransform.options()` — the one that injects `sessionID` as a
+ *        cache key — is deliberately NOT used here.
+ *      * `instructions` (the OAuth transport's system channel) is
+ *        `payload.system` verbatim: no request id, timestamp, cwd or session id
+ *        is spliced in anywhere on the system path.
+ *      * `temperature` / `topP` / `topK` / `maxOutputTokens` derive from the
+ *        model and the payload only.
+ *      * the one value that *was* per-call random — the `session-id` header —
+ *        is now {@link cacheID}, a hash of the system prompt.
+ *    The corollary belongs to the CALLER: a system prompt that changes between
+ *    calls (a clock, a counter, a re-ordered set) silently costs a full
+ *    uncached prefix every time.
+ *
+ * `usage` on the response carries `cacheReadInputTokens` where the provider
+ * reports it, so the caller can tell a cache hit from a hopeful one.
  */
 export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (handlers) =>
   Effect.gen(function* () {
@@ -137,7 +267,8 @@ export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (han
       // OAuth (Codex) transport carries the system prompt as `instructions`
       // rather than a system message.
       const isOpenaiOauth = model.providerID === "openai" && info?.type === "oauth"
-      const options = { ...ProviderTransform.smallOptions(model) }
+      const id = cacheID(payload.system)
+      const options = { ...ProviderTransform.smallOptions(model), ...cacheKeyOptions(model, id) }
       if (isOpenaiOauth) options.instructions = payload.system
 
       const ceiling = ProviderTransform.maxOutputTokens(model)
@@ -147,9 +278,15 @@ export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (han
           ? ceiling
           : Math.max(1, Math.min(Math.floor(payload.maxTokens), ceiling))
       const stopSequences = payload.stopSequences?.filter((x) => x.length > 0) ?? []
-      const requestID = `judge-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+      // On the OAuth transport the system prompt travels as `instructions`, so
+      // there is no system message to mark — and nothing to mark it with, since
+      // that transport caches automatically.
+      const messages: ModelMessage[] = [
+        ...(isOpenaiOauth ? [] : [systemMessage(payload.system, model, options)]),
+        { role: "user", content: payload.user },
+      ]
 
-      const text = yield* Effect.tryPromise({
+      const result = yield* Effect.tryPromise({
         try: async (signal) => {
           // MUST stream. The session path always uses `streamText`, and at
           // least one provider transport depends on it: the ChatGPT/Codex
@@ -160,15 +297,17 @@ export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (han
           let failure: unknown
           const stream = streamText({
             model: language,
-            ...(isOpenaiOauth ? {} : { system: payload.system }),
-            prompt: payload.user,
+            // `messages`, not `system` + `prompt`: a cache breakpoint is
+            // attached to the system MESSAGE, and the string form has nowhere
+            // to hang `providerOptions`.
+            messages,
             ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
             ...(stopSequences.length > 0 ? { stopSequences: [...stopSequences] } : {}),
             temperature: model.capabilities.temperature ? ProviderTransform.temperature(model) : undefined,
             topP: ProviderTransform.topP(model),
             topK: ProviderTransform.topK(model),
             providerOptions: ProviderTransform.providerOptions(model, options),
-            headers: { ...model.headers, ...providerHeaders(model, requestID) },
+            headers: { ...model.headers, ...providerHeaders(model, id) },
             maxRetries: 0,
             abortSignal: signal,
             // `streamText` reports mid-stream failures here rather than
@@ -181,12 +320,14 @@ export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (han
           })
           const collected = await stream.text
           if (failure !== undefined) throw failure
-          return collected
+          // Awaited after the text so a usage promise that never settles on a
+          // failed stream cannot hide the real error.
+          return { text: collected, usage: usageOf(await stream.usage) }
         },
         catch: (cause) => upstream(model.providerID, cause),
       })
 
-      return { text }
+      return result.usage === undefined ? { text: result.text } : { text: result.text, usage: result.usage }
     })
 
     return handlers.handle("completion", completion)
