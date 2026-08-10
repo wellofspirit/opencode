@@ -103,17 +103,25 @@ function rejectsOutputCap(model: Provider.Model): boolean {
  * `llmgateway` is paired with `openrouter` because it takes the same request
  * body shape; `ProviderTransform.smallOptions` already treats the two together
  * when it disables reasoning for OpenRouter's Google models
- * (provider/transform.ts). That branch, a variant, or user config setting
- * `reasoning` explicitly wins — hence the key check rather than an override.
+ * (provider/transform.ts).
+ *
+ * This is an OVERRIDE, not a default: `smallOptions` seeds the options from the
+ * model's first variant, and `ProviderTransform.reasoningVariants` synthesizes
+ * variants for every model whose models.dev entry lists `reasoning_options` —
+ * for OpenRouter that first variant is `{ reasoning: { effort: … } }`
+ * (`reasoningEffort`, transform.ts). So a `reasoning` key here is derived
+ * registry metadata, not a user's judge preference, and deferring to it
+ * reinstates exactly the empty-verdict failure (verified live: the deepseek
+ * model above ships effort variants, and the key check silently kept its
+ * reasoning on). A judge that must answer in the text channel has no
+ * reasoning-on configuration to respect.
  *
  * The injected value is a constant, so it stays byte-identical call to call and
  * cannot disturb the stable-prefix requirement the handler's caching note
  * depends on.
  */
-function disablesNativeReasoning(model: Provider.Model, options: Record<string, unknown>): boolean {
-  if (model.providerID !== "openrouter" && model.providerID !== "llmgateway") return false
-  if (!model.capabilities.reasoning) return false
-  return !("reasoning" in options)
+function disablesNativeReasoning(model: Provider.Model): boolean {
+  return (model.providerID === "openrouter" || model.providerID === "llmgateway") && model.capabilities.reasoning
 }
 
 /**
@@ -303,7 +311,7 @@ export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (han
       const isOpenaiOauth = model.providerID === "openai" && info?.type === "oauth"
       const id = cacheID(payload.system)
       const options = { ...ProviderTransform.smallOptions(model), ...cacheKeyOptions(model, id) }
-      if (disablesNativeReasoning(model, options)) options.reasoning = { enabled: false }
+      if (disablesNativeReasoning(model)) options.reasoning = { enabled: false }
       if (isOpenaiOauth) options.instructions = payload.system
 
       const ceiling = ProviderTransform.maxOutputTokens(model)
