@@ -83,6 +83,40 @@ function rejectsOutputCap(model: Provider.Model): boolean {
 }
 
 /**
+ * Whether to spend this model's output budget on the ANSWER rather than on a
+ * native reasoning channel.
+ *
+ * OpenRouter bills reasoning tokens against the same `max_tokens` cap the reply
+ * comes out of, and `stream.text` collects only the text channel. A judge call
+ * is a deliberately tight budget — ClaudeUI's classifier runs its first stage at
+ * `maxTokens: 64` with a `</block>` stop sequence — so a natively-reasoning
+ * model spends the entire cap thinking and returns `finish_reason: "length"`
+ * with EMPTY text. To a fail-closed caller that is an unparseable verdict, i.e.
+ * the judge fails exactly on the hard inputs it exists for. Observed live on
+ * `deepseek/deepseek-v4-flash-latest`; with `reasoning: { enabled: false }` the
+ * same model reports ~0 reasoning tokens and answers in seven.
+ *
+ * Nothing is lost by turning it off: the judge prompts carry their own inline
+ * `<thinking>` protocol, so the deliberation happens in the text channel — the
+ * only channel this route reads, and the one the verdict must arrive in.
+ *
+ * `llmgateway` is paired with `openrouter` because it takes the same request
+ * body shape; `ProviderTransform.smallOptions` already treats the two together
+ * when it disables reasoning for OpenRouter's Google models
+ * (provider/transform.ts). That branch, a variant, or user config setting
+ * `reasoning` explicitly wins — hence the key check rather than an override.
+ *
+ * The injected value is a constant, so it stays byte-identical call to call and
+ * cannot disturb the stable-prefix requirement the handler's caching note
+ * depends on.
+ */
+function disablesNativeReasoning(model: Provider.Model, options: Record<string, unknown>): boolean {
+  if (model.providerID !== "openrouter" && model.providerID !== "llmgateway") return false
+  if (!model.capabilities.reasoning) return false
+  return !("reasoning" in options)
+}
+
+/**
  * Headers the built-in plugins add. Only openai's are reproduced: the Codex
  * endpoint expects the `originator`/User-Agent shape the codex CLI sends
  * (plugin/openai/codex.ts:549-557). Copilot's extra headers are version and
@@ -269,6 +303,7 @@ export const judgeHandlers = HttpApiBuilder.group(InstanceHttpApi, "judge", (han
       const isOpenaiOauth = model.providerID === "openai" && info?.type === "oauth"
       const id = cacheID(payload.system)
       const options = { ...ProviderTransform.smallOptions(model), ...cacheKeyOptions(model, id) }
+      if (disablesNativeReasoning(model, options)) options.reasoning = { enabled: false }
       if (isOpenaiOauth) options.instructions = payload.system
 
       const ceiling = ProviderTransform.maxOutputTokens(model)
