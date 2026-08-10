@@ -116,6 +116,18 @@ function rejectsOutputCap(model: Provider.Model): boolean {
  * reasoning on). A judge that must answer in the text channel has no
  * reasoning-on configuration to respect.
  *
+ * Residual risk, accepted deliberately: OpenRouter's own `/api/v1/models`
+ * carries a per-model `reasoning.mandatory` flag ("do not send effort 'none' —
+ * the model rejects it"), and this route cannot see it — the models.dev shape
+ * `Provider.Model` is built from provably cannot express it (deepseek-v4-flash
+ * and grok publish identical effort lists; only the former can turn reasoning
+ * off). Verified live on two non-mandatory models (deepseek-v4-flash, kimi):
+ * `enabled: false` is honoured with 0 reasoning tokens. If a `mandatory: true`
+ * judge model ever rejects it, the failure is per-call and fail-safe: the
+ * upstream error propagates to the caller, whose classifier maps it to
+ * "unavailable → ask the human" — a visible degradation, never a wrong allow.
+ * Should that materialize, gate on the OpenRouter flag rather than models.dev.
+ *
  * The injected value is a constant, so it stays byte-identical call to call and
  * cannot disturb the stable-prefix requirement the handler's caching note
  * depends on.
